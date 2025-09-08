@@ -114,7 +114,6 @@ def admin_add_service_mapping():
             s.close()
             return redirect(url_for('admin.admin_service_mappings'))
 
-        # التحقق الإضافي للتأكد من أن service موجود قبل استخدام base_price
         if service is None:
             flash("الخدمة غير موجودة (تحقق إضافي)", "error")
             s.close()
@@ -153,7 +152,7 @@ def admin_fetch_provider_services():
         provider_id = request.form.get('provider_id')
 
         provider = SMMProvider(provider_id)
-        services = provider.get_services()
+        api_services = provider.get_services()
 
         s = Session()
         providers = s.query(ServiceProvider).all()
@@ -161,17 +160,18 @@ def admin_fetch_provider_services():
             joinedload(ServiceMapping.service),
             joinedload(ServiceMapping.provider)
         ).all()
+        local_services = s.query(Service).options(joinedload(Service.category)).all()
         s.close()
 
-        if 'error' in services:
-            flash(f"خطأ في جلب الخدمات: {services['error']}", "error")
-            services = []
+        if 'error' in api_services:
+            flash(f"خطأ في جلب الخدمات: {api_services['error']}", "error")
+            api_services = []
 
         return render_template('service_mappings.html',
                              providers=providers,
-                             services=s.query(Service).all(),
+                             services=local_services,
                              service_mappings=service_mappings,
-                             provider_services=services,
+                             provider_services=api_services,
                              csrf_token=generate_csrf())
 
     except Exception as e:
@@ -263,7 +263,12 @@ def admin_add_service_from_provider():
         if max_quantity > provider_max:
             max_quantity = provider_max
 
-        price_multiplier = service_price / provider_price
+        price_multiplier = 1.0
+        if provider_price > 0:
+            price_multiplier = service_price / provider_price
+        else:
+            flash("سعر المزود غير صالح، تم تعيين المضاعف إلى 1.0", "warning")
+            price_multiplier = 1.0
 
         new_service = Service(
             name=service_info.get('name', 'خدمة بدون اسم'),

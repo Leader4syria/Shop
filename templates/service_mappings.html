@@ -174,15 +174,20 @@
             </thead>
             <tbody>
                 {% for mapping in service_mappings %}
+                {% if mapping.service %}
                 <tr class="hover:bg-gray-50">
                     <td>{{ mapping.id }}</td>
                     <td>{{ mapping.service.name }}</td>
                     <td>{{ mapping.provider.name }}</td>
                     <td>{{ mapping.provider_service_id }}</td>
-                    <td>${{ mapping.service.base_price }}</td>
+                    <td>${{ "%.4f"|format(mapping.service.base_price) }}</td>
                     <td>
-                        {% set provider_price = mapping.service.base_price / mapping.price_multiplier %}
-                        ${{ "%.4f"|format(provider_price) }}
+                        {% if mapping.price_multiplier > 0 %}
+                            {% set provider_price = mapping.service.base_price / mapping.price_multiplier %}
+                            ${{ "%.4f"|format(provider_price) }}
+                        {% else %}
+                            <span class="text-red-500">N/A</span>
+                        {% endif %}
                     </td>
                     <td>
                         {{ "%.4f"|format(mapping.price_multiplier) }}
@@ -202,6 +207,20 @@
                         </form>
                     </td>
                 </tr>
+                {% else %}
+                <tr class="hover:bg-red-50 bg-red-50 border-l-4 border-red-500">
+                    <td>{{ mapping.id }}</td>
+                    <td colspan="8" class="text-red-700 font-bold p-3">
+                        هذا الربط (ID: {{ mapping.id }}) يشير إلى خدمة محذوفة (Service ID: {{ mapping.service_id }}). الرجاء حذفه لتجنب المشاكل.
+                    </td>
+                    <td>
+                        <form action="{{ url_for('admin.admin_delete_service_mapping', mapping_id=mapping.id) }}" method="POST" class="inline">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                            <button type="submit" class="btn-danger text-xs ml-2" onclick="return confirm('هل تريد حذف هذا الربط المعطوب؟')">حذف</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endif %}
                 {% endfor %}
             </tbody>
         </table>

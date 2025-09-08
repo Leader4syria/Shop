@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from telebot import TeleBot
-from database import init_db, Session, User, Category, Service, Order
+from database import init_db, Session, User, Category, Service, Order, ServiceMapping
 from flask import Flask, jsonify, request
 from pyngrok import ngrok, conf
 import bot
@@ -22,6 +22,7 @@ import uuid
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sync_supabase import main as sync_supabase_main
+from smm_providers import SMMProvider
 
 app = Flask(__name__, static_folder='web')
 app.config['SECRET_KEY'] = FLASK_SECRET_KEY
@@ -81,20 +82,13 @@ def start_telegram_bot():
             time.sleep(10)
 
 def is_valid_init_data(init_data_str: str, bot_token: str) -> (bool, dict):
-    """
-    Validates the initData string from the Telegram Web App using a more
-    robust parsing method that handles URL-encoded values.
-    """
     try:
-        # Use parse_qsl which handles URL decoding of keys and values.
-        # It returns a list of (key, value) tuples.
         parsed_qsl = parse_qsl(init_data_str)
 
         hash_from_telegram = None
         data_for_check_tuples = []
         user_data_str = None
 
-        # Separate the hash from the rest of the data
         for key, value in parsed_qsl:
             if key == 'hash':
                 hash_from_telegram = value
@@ -106,11 +100,9 @@ def is_valid_init_data(init_data_str: str, bot_token: str) -> (bool, dict):
         if not hash_from_telegram or not user_data_str:
             return False, None
 
-        # The data_check_string is formed from the decoded key-value pairs, sorted.
         sorted_tuples = sorted(data_for_check_tuples, key=lambda x: x[0])
         data_check_string = "\n".join([f"{k}={v}" for k, v in sorted_tuples])
 
-        # The rest of the hashing logic remains the same
         secret_key = hmac.new("WebAppData".encode(), bot_token.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
@@ -121,7 +113,6 @@ def is_valid_init_data(init_data_str: str, bot_token: str) -> (bool, dict):
         print("--- END DEBUG ---")
 
         if calculated_hash == hash_from_telegram:
-            # The user data string from parse_qsl is already URL-decoded.
             user_data = json.loads(user_data_str)
             return True, user_data
 
@@ -132,10 +123,6 @@ def is_valid_init_data(init_data_str: str, bot_token: str) -> (bool, dict):
 
 @app.route('/api/webapp/data', methods=['POST'])
 def get_webapp_data():
-    """
-    API endpoint to fetch all necessary data for the web app.
-    Authenticates the user using the initData from Telegram.
-    """
     try:
         init_data_str = request.json.get('initData')
         if not init_data_str:
@@ -152,30 +139,25 @@ def get_webapp_data():
         try:
             user = s.query(User).filter_by(telegram_id=user_id).first()
             if not user:
-                 # If user does not exist, create them
                 user = User(
                     telegram_id=user_id,
                     full_name=user_data.get('first_name', '') + ' ' + user_data.get('last_name', ''),
                     username=user_data.get('username'),
-                    balance=0.0 # Default balance
+                    balance=0.0
                 )
                 s.add(user)
                 s.commit()
-                # Re-fetch user to get ID and other defaults
                 user = s.query(User).filter_by(telegram_id=user_id).first()
 
-            # Fetch user and order data
             orders_q = s.query(Order).filter_by(user_id=user_id).order_by(Order.ordered_at.desc()).all()
 
             service_map = {}
             service_ids = {o.service_id for o in orders_q}
             if service_ids:
-                # Fetch all corresponding services in a single query
                 services = s.query(Service).filter(Service.id.in_(service_ids)).all()
                 service_map = {service.id: service.name for service in services}
 
 
-            # Serialize data into a clean format for the frontend
             user_info = {
                 "id": user.telegram_id,
                 "full_name": user.full_name,
@@ -206,10 +188,6 @@ def get_webapp_data():
 
 @app.route('/api/create_order', methods=['POST'])
 def create_order():
-    """
-    API endpoint to create a new order in the local database.
-    Authenticates the user, checks balance, creates order, and updates balance.
-    """
     try:
         init_data_str = request.json.get('initData')
         if not init_data_str:
@@ -221,11 +199,8 @@ def create_order():
 
         user_id = user_data.get('id')
 
-        # Get order details from request
         service_id = request.json.get('service_id')
         service_name = request.json.get('service_name')
-        # We trust the service_name from the client for the admin notification.
-        # The service_id is the source of truth for all internal order processing.
         quantity = request.json.get('quantity')
         total_price = request.json.get('total_price')
         link_or_id = request.json.get('link_or_id')
@@ -249,7 +224,7 @@ def create_order():
                 quantity=quantity,
                 link_or_id=link_or_id,
                 total_price=total_price,
-                status='pending',
+                status='Pending',
                 ordered_at=datetime.now()
             )
             s.add(new_order)
@@ -257,21 +232,12 @@ def create_order():
             user.balance -= float(total_price)
 
             s.commit()
-            order_id = new_order.id # Get the ID of the newly created order
+            order_id = new_order.id
 
-            # Get the new balance BEFORE closing the session
             new_balance = user.balance
 
-            s.close() # Close the session to avoid conflicts if the API call is slow
+            s.close()
 
-            # Start API Automation Logic in a new thread to avoid blocking
-            automation_thread = threading.Thread(
-                target=automate_order,
-                args=(order_id, user.id, service_id, service_name, full_params, total_price)
-            )
-            automation_thread.start()
-
-            # Return success response to the user immediately
             return jsonify({
                 "ok": True,
                 "message": "Order created successfully!",
@@ -284,7 +250,6 @@ def create_order():
             return jsonify({"ok": False, "error": "Could not create order"}), 500
         finally:
             s.close()
-
     except Exception as e:
         print(f"Error in create_order: {e}")
         return jsonify({"ok": False, "error": "An internal error occurred"}), 500
@@ -294,24 +259,20 @@ def automate_order(order_id, user_id, service_id, service_name, full_params, tot
     try:
         provider_service_id = service_id
 
-        # Prepare parameters for the external API
         param_keys = list(full_params.keys())
 
         payload = {
             'order_uuid': str(uuid.uuid4())
         }
 
-        # The first parameter is always playerId
         if param_keys:
             player_id_key = param_keys[0]
             payload['playerId'] = full_params[player_id_key]
 
-        # Add any other params to the payload
         if len(param_keys) > 1:
             for key in param_keys[1:]:
                 payload[key] = full_params[key]
 
-        # Get the quantity from the order we just created
         order = s.query(Order).filter_by(id=order_id).first()
         if not order:
             print(f"Could not find order {order_id} to automate.")
@@ -328,12 +289,11 @@ def automate_order(order_id, user_id, service_id, service_name, full_params, tot
 
         try:
             response = requests.get(url, headers=headers, params=payload, timeout=30)
-            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+            response.raise_for_status()
 
             data = response.json()
 
             if data.get("status") == "OK" and data.get("data", {}).get("status") in ["accept", "wait"]:
-                # API call was successful
                 order.status = 'In Progress'
                 order.provider_order_id = data.get("data", {}).get("order_id")
                 s.commit()
@@ -348,21 +308,17 @@ def automate_order(order_id, user_id, service_id, service_name, full_params, tot
                     except Exception as e:
                         print(f"Failed to send success notification to admin {admin_id}: {e}")
             else:
-                # API returned a logical error
                 failure_reason = data.get("data", {}).get("message", "No reason provided by API.")
                 raise Exception(f"API rejected order: {failure_reason}")
 
         except Exception as api_error:
-            # Handle request exceptions or logical API errors
             error_details = str(api_error)
             if isinstance(api_error, requests.exceptions.HTTPError):
                 try:
-                    # Try to get more detailed error from JSON response
                     error_details += f"\nرد السيرفر: {api_error.response.json()}"
                 except json.JSONDecodeError:
                     error_details += f"\nرد السيرفر: {api_error.response.text}"
 
-            # Prepare detailed notification for admin
             user_full_name = order.user.full_name if order.user else "مستخدم غير معروف"
             params_str = "\n".join([f" - {key}: `{value}`" for key, value in full_params.items()])
 
@@ -383,9 +339,6 @@ def automate_order(order_id, user_id, service_id, service_name, full_params, tot
 
             for admin_id in ADMIN_IDS:
                 try:
-                    # Using MarkdownV2, so need to escape some characters if not already handled
-                    # For simplicity, sending as is, assuming names don't have special chars.
-                    # A more robust solution might escape names and values.
                     bot.bot.send_message(admin_id, manual_notification, parse_mode="Markdown")
                 except Exception as e:
                     print(f"Failed to send failure notification to admin {admin_id}: {e}")
@@ -417,7 +370,6 @@ def order_status_checker():
                     "Accept": "application/json",
                     "Connection": "keep-alive"
                 }
-                # The API expects the list of orders as a comma-separated string in the 'orders' parameter
                 params = {'orders': ','.join(order_ids_to_check)}
 
                 try:
@@ -428,7 +380,6 @@ def order_status_checker():
                     print(f"API response: {status_data}")
 
                     if status_data.get("status") == "OK" and "data" in status_data:
-                        # Create a map of provider_order_id to local order object for easy lookup
                         order_map = {order.provider_order_id: order for order in in_progress_orders}
 
                         for status_info in status_data["data"]:
@@ -445,7 +396,6 @@ def order_status_checker():
 
                                 order_to_update.status = 'Completed'
                                 s.commit()
-                                # Notify user of completion
                                 try:
                                     completion_message = f"✅ اكتمل طلبك!\n\n"
                                     completion_message += f"الخدمة: {service_name}\n"
@@ -460,12 +410,10 @@ def order_status_checker():
                                 service_name = service.name if service else "خدمة غير معروفة"
 
                                 order_to_update.status = 'Canceled'
-                                # Refund user
                                 user_to_refund = s.query(User).filter_by(telegram_id=order_to_update.user_id).first()
                                 if user_to_refund:
                                     user_to_refund.balance += order_to_update.total_price
                                     s.commit()
-                                    # Notify user of rejection and refund
                                     try:
                                         rejection_message = f"⚠️ تم رفض طلبك للخدمة '{service_name}'.\n\n"
                                         rejection_message += "لا يمكنك طلب هذه الخدمة حالياً، حاول بعد ساعة. تم إعادة المبلغ إلى رصيدك."
@@ -482,12 +430,10 @@ def order_status_checker():
             print(f"An error occurred in the order status checker: {e}")
             traceback.print_exc()
 
-        # Wait for 5 minutes before the next check
         time.sleep(300)
 
 
 async def run_sync_and_notify():
-    """Runs the main sync function and notifies admins upon completion."""
     print("🚀 Starting Supabase sync...")
     try:
         await sync_supabase_main()
@@ -503,17 +449,11 @@ async def run_sync_and_notify():
         traceback.print_exc()
 
 def supabase_sync_scheduler():
-    """
-    Sets up and runs the scheduler for the Supabase sync.
-    Runs once immediately, then schedules for every 12 hours.
-    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Run the sync immediately
     loop.run_until_complete(run_sync_and_notify())
 
-    # Schedule the job to run every 12 hours
     scheduler = AsyncIOScheduler(event_loop=loop)
     scheduler.add_job(run_sync_and_notify, 'interval', hours=12)
     scheduler.start()
@@ -527,6 +467,53 @@ def supabase_sync_scheduler():
         scheduler.shutdown()
         loop.close()
 
+def process_automatic_orders():
+    from smm_providers import SMMProvider
+    from database import Session, Order, ServiceMapping
+    from sqlalchemy.orm import joinedload
+    
+    while True:
+        try:
+            s = Session()
+            # جلب الطلبات المعلقة التي لها تعيين خدمة
+            orders = s.query(Order).options(
+                joinedload(Order.service)
+            ).filter(
+                Order.status == 'Pending',
+                Order.service.has(ServiceMapping.id.isnot(None))
+            ).all()
+
+            for order in orders:
+                mapping = s.query(ServiceMapping).filter_by(
+                    service_id=order.service_id
+                ).first()
+
+                if mapping:
+                    provider = SMMProvider(mapping.provider_id)
+                    result = provider.add_order(
+                        mapping.id,
+                        order.link_or_id,
+                        order.quantity
+                    )
+
+                    if 'order' in result:
+                        order.status = 'Processing'
+                        order.provider_order_id = result['order']
+                        s.commit()
+                        print(f"✅ تم إرسال الطلب {order.id} إلى المزود، رقم الطلب: {result['order']}")
+
+                    elif 'error' in result:
+                        print(f"❌ خطأ في الطلب {order.id}: {result['error']}")
+                        # يمكنك تحديث حالة الطلب إلى فشل أو تركها معلقة
+
+                time.sleep(2)  # تأخير بين الطلبات
+
+            s.close()
+            time.sleep(30)  # التحقق كل 30 ثانية
+
+        except Exception as e:
+            print(f"❌ خطأ في معالجة الطلبات التلقائية: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     init_db()
@@ -538,7 +525,6 @@ if __name__ == "__main__":
         s.commit()
     s.close()
 
-    # Set up ngrok tunnel
     NGROK_AUTH_TOKEN = os.environ.get("NGROK_AUTH_TOKEN")
     if NGROK_AUTH_TOKEN:
         conf.get_default().auth_token = NGROK_AUTH_TOKEN
@@ -564,6 +550,10 @@ if __name__ == "__main__":
     supabase_sync_thread = threading.Thread(target=supabase_sync_scheduler)
     supabase_sync_thread.daemon = True
     supabase_sync_thread.start()
+    
+    auto_order_thread = threading.Thread(target=process_automatic_orders)
+    auto_order_thread.daemon = True
+    auto_order_thread.start()
 
     server_url = f"http://YOUR_SERVER_IP:{FLASK_PORT}"
     print("✅ تم تشغيل المشروع بنجاح!")
